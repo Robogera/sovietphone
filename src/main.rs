@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use debouncr::{debounce_stateful_16, Edge};
+use debouncr::debounce_stateful_16;
 use panic_halt as _;
 
 const TIME_DELTA_MS: u32 = 10;
@@ -12,7 +12,7 @@ const DATA_LENGTH: u8 = 0x06;
 const END_BYTE: u8 = 0xEF;
 const FEEDBACK: u8 = 0x00;
 
-const VOLUME_MAX: u8 = 20;
+const VOLUME_MAX: u8 = 23;
 const FADEOUT_DURATION_MS: u32 = 1000;
 
 const GRACE_MS: u32 = 1000;
@@ -115,6 +115,7 @@ fn main() -> ! {
     let mut debounced_button = debounce_stateful_16(button.is_high());
 
     loop {
+        // Maybe add another debouncer ring buffer? Seems to work ok tho
         if busy.is_high() {
             led.set_high()
         } else {
@@ -124,11 +125,12 @@ fn main() -> ! {
         player_state = match player_state {
             // When the voice stops
             PlayerState::Playing if busy.is_high() => PlayerState::Stopped,
-            // Maybe?
+            // Never happens, but if in some bizzare case the arduino is
+            // rebootet during the playback this should kill the audio
             PlayerState::Stopped if busy.is_low() => {
                 dfplayer_command(&mut serial, CMD_STOP, 0, 0);
                 PlayerState::Stopped
-            },
+            }
             state => state,
         };
 
@@ -151,11 +153,12 @@ fn main() -> ! {
                         arduino_hal::delay_ms(TIME_DELTA_MS);
                     }
                     PlayerState::Stopped
-                },
+                }
             };
+
             // Dropping previous button values to prevent weird things
             // from happening if button was messed with during the
-            // fadeout or grace periods
+            // fadeout grace period
             debounced_button = debounce_stateful_16(button.is_high());
         }
 
