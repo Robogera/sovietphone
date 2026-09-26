@@ -1,54 +1,20 @@
 #![no_std]
 #![no_main]
 
-use debouncr::debounce_stateful_16;
+mod dfplayer;
+
+use dfplayer::DFPlayerCommand;
+
 use panic_halt as _;
 
-const TIME_DELTA_MS: u32 = 10;
+const TIME_STEP_MS: u32 = 5;
+const WAIT_AFTER_LAST_DIGIT_MS: u32 = 1250;
+const RETURN_CALL_DELAY_MS: u32 = 8500;
+const CORRECT_NUMBER: u8 = 16;
+const COIL_ON_MS: u32 = 1000;
+const COIL_OFF_MS: u32 = 4000;
 
-const START_BYTE: u8 = 0x7E;
-const VERSION_BYTE: u8 = 0xFF;
-const DATA_LENGTH: u8 = 0x06;
-const END_BYTE: u8 = 0xEF;
-const FEEDBACK: u8 = 0x00;
-
-const VOLUME_MAX: u8 = 23;
-const FADEOUT_DURATION_MS: u32 = 1000;
-
-const GRACE_MS: u32 = 1000;
-
-const CMD_SET_VOLUME: u8 = 0x06;
-const CMD_PLAY_TRACK: u8 = 0x03;
-const CMD_STOP: u8 = 0x16;
-
-enum PlayerState {
-    Stopped,
-    Playing,
-}
-
-fn get_checksum(
-    version: u8,
-    length: u8,
-    command: u8,
-    feedback: u8,
-    param_high: u8,
-    param_low: u8,
-) -> (u8, u8) {
-    let sum = version as u16
-        + length as u16
-        + command as u16
-        + feedback as u16
-        + param_high as u16
-        + param_low as u16;
-    let checksum = 0u16.wrapping_sub(sum);
-    ((checksum >> 8) as u8, (checksum & 0xFF) as u8)
-}
-
-pub trait WriteFrame {
-    fn write_frame(&mut self, frame: [u8; 10]);
-}
-
-impl<USART, RX, TX> WriteFrame for arduino_hal::Usart<USART, RX, TX>
+impl<USART, RX, TX> dfplayer::WriteFrame for arduino_hal::Usart<USART, RX, TX>
 where
     USART: arduino_hal::hal::usart::UsartOps<arduino_hal::hal::Atmega, RX, TX>,
 {
@@ -59,31 +25,264 @@ where
     }
 }
 
-fn dfplayer_command<W: WriteFrame>(serial: &mut W, command: u8, param_high: u8, param_low: u8) {
-    let (checksum_high, checksum_low) = get_checksum(
-        VERSION_BYTE,
-        DATA_LENGTH,
-        command,
-        FEEDBACK,
-        param_high,
-        param_low,
-    );
+enum CallType {
+    Outgoing,
+    Incoming,
+}
 
-    let frame = [
-        START_BYTE,
-        VERSION_BYTE,
-        DATA_LENGTH,
-        command,
-        FEEDBACK,
-        param_high,
-        param_low,
-        checksum_high,
-        checksum_low,
-        END_BYTE,
-    ];
+type UntilReturnCallMs = u32;
 
-    serial.write_frame(frame);
-    arduino_hal::delay_ms(150);
+enum State {
+    Idle {
+        until_return_call_ms: Option<u32>,
+    },
+    WaitingForDial,
+    Dialing {
+        number: u8,
+        pulses: u8,
+        wait_ms: u32,
+    },
+    Call(CallType),
+    WrongNumber,
+    AudioEnded,
+    Ringing {
+        coil: Option<Coil>,
+        wait_ms: u32,
+    },
+}
+
+enum Input {
+    Hook(HookInput),
+    Dial(DialInput),
+    PlaybackOver,
+}
+
+enum DialInput {
+    Moving,
+    Stopped,
+    Pulse,
+}
+
+enum HookInput {
+    On,
+    Off,
+}
+
+#[repr(u16)]
+enum Track {
+    VoiceOutgoing = 1u16,
+    VoiceIncoming = 2u16,
+    ShortBeep = 3u16,
+    ContinuousBeep = 4u16,
+}
+
+enum Coil {
+    Left,
+    Right,
+}
+
+enum Effect {
+    PlayTrack(Track),
+    LoopTrack(Track),
+    StopPlayback,
+    PowerCoil(Option<Coil>),
+}
+
+impl State {
+    fn next(&mut self, input: Option<Input>) -> Option<Effect> {
+        let (new_state, effect) = apply_next_state(self, input);
+        *self = new_state;
+        effect
+    }
+}
+
+fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effect>) {
+    use CallType::*;
+    use Coil::*;
+    use DialInput::*;
+    use Effect::*;
+    use HookInput::*;
+    use Input::*;
+    use State::*;
+    use Track::*;
+
+    match (state, input) {
+        // Play a continuous beep when the phone is off the hook
+        (
+            Idle {
+                until_return_call_ms: _,
+            },
+            Some(Hook(Off)),
+        ) => (WaitingForDial, Some(LoopTrack(ContinuousBeep))),
+
+        // Start ringing when the time comes for scheduled incoming call
+        (
+            Idle {
+                until_return_call_ms: Some(0),
+            },
+            None,
+        ) => (
+            Ringing {
+                coil: Some(Left),
+                wait_ms: COIL_ON_MS,
+            },
+            Some(PowerCoil(Some(Left))),
+        ),
+
+        // Stop the ringing when the phone is off the hook
+        (
+            Ringing {
+                coil: _,
+                wait_ms: _,
+            },
+            Some(Hook(Off)),
+        ) => (Call(Incoming), Some(PlayTrack(VoiceIncoming))),
+
+        // Switch the ring bell on/off
+        (Ringing { coil, wait_ms: 0 }, _) => match coil {
+            None => (
+                Ringing {
+                    coil: Some(Left),
+                    wait_ms: COIL_ON_MS,
+                },
+                Some(PowerCoil(Some(Left))),
+            ),
+            Some(_) => (
+                Ringing {
+                    coil: None,
+                    wait_ms: COIL_OFF_MS,
+                },
+                Some(PowerCoil(None)),
+            ),
+        },
+
+        // Count down time when ringing
+        // TODO: reduce verbosity
+        (Ringing { coil, wait_ms }, _) => match coil {
+            Some(Left) => (
+                Ringing {
+                    coil: Some(Right),
+                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
+                },
+                Some(PowerCoil(Some(Right))),
+            ),
+            Some(Right) => (
+                Ringing {
+                    coil: Some(Left),
+                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
+                },
+                Some(PowerCoil(Some(Left))),
+            ),
+            None => (
+                Ringing {
+                    coil: None,
+                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
+                },
+                Some(PowerCoil(None)),
+            ),
+        },
+
+        // Shut the continuous beep when the dial starts moving
+        (WaitingForDial, Some(Dial(Moving))) => (
+            Dialing {
+                number: 0,
+                pulses: 0,
+                wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
+            },
+            Some(StopPlayback),
+        ),
+
+        // Count the pulses when the rotary dial comes to rest
+        (
+            Dialing {
+                number,
+                pulses,
+                wait_ms: _,
+            },
+            Some(Dial(Stopped)),
+        ) => (
+            Dialing {
+                number: number.saturating_mul(10).saturating_add(*pulses),
+                pulses: 0,
+                wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
+            },
+            None,
+        ),
+
+        // Increment the pulse counter
+        (
+            Dialing {
+                number,
+                pulses,
+                wait_ms: _,
+            },
+            Some(Dial(Pulse)),
+        ) => (
+            Dialing {
+                number: *number,
+                pulses: pulses.wrapping_add(1),
+                wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
+            },
+            None,
+        ),
+
+        // Win! Play the outgoing call audio if user has guessed the secret number!!!
+        (
+            Dialing {
+                number: CORRECT_NUMBER,
+                pulses: _,
+                wait_ms: 0,
+            },
+            None,
+        ) => (Call(Outgoing), Some(PlayTrack(VoiceOutgoing))),
+
+        // User waited until the voice clip ended. Play line busy signal
+        (Call(Outgoing), Some(PlaybackOver)) => (AudioEnded, Some(LoopTrack(ShortBeep))),
+
+        // User hanged the phone during audio playback (rude) or after the audio has ended
+        (Call(Outgoing) | AudioEnded, Some(Hook(On))) => (
+            Idle {
+                until_return_call_ms: None,
+            },
+            Some(StopPlayback),
+        ),
+
+        // Play the busy signal if the user didn't guess the number.
+        (
+            Dialing {
+                number: _,
+                pulses: _,
+                wait_ms: 0,
+            },
+            None,
+        ) => (WrongNumber, Some(LoopTrack(ShortBeep))),
+
+        // Schedule the return call if the phone was put down
+        // after any incorrect interaction
+        (
+            WaitingForDial
+            | Dialing {
+                number: _,
+                pulses: _,
+                wait_ms: _,
+            }
+            | WrongNumber,
+            Some(Hook(On)),
+        ) => (
+            Idle {
+                until_return_call_ms: Some(RETURN_CALL_DELAY_MS),
+            },
+            Some(StopPlayback),
+        ),
+
+        // Catchall
+        (_, _) => (
+            Idle {
+                until_return_call_ms: None,
+            },
+            None,
+        ),
+    }
 }
 
 #[arduino_hal::entry]
@@ -102,66 +301,32 @@ fn main() -> ! {
         arduino_hal::hal::usart::BaudrateArduinoExt::into_baudrate(9600),
     );
 
-    let button = pins.d3.into_pull_up_input();
-    let busy = pins.d6.into_floating_input();
+    let dfplayer_busy = pins.d4.into_pull_up_input();
+    let handset = pins.d5.into_pull_up_input();
+    let dial_moved = pins.d6.into_pull_up_input();
+    let dial_pulse = pins.d7.into_pull_up_input();
 
     let mut led = pins.d13.into_output();
     led.set_low();
 
-    let mut player_state = PlayerState::Stopped;
+    let mut coil1 = pins.d8.into_output();
+    let mut coil2 = pins.d9.into_output();
+    coil1.set_low();
+    coil2.set_low();
+
+    let mut state = State::Idle {
+        until_return_call_ms: None,
+    };
 
     arduino_hal::delay_ms(1000);
 
-    let mut debounced_button = debounce_stateful_16(button.is_high());
+    dfplayer::send(&mut serial, DFPlayerCommand::Stop);
 
     loop {
-        // Maybe add another debouncer ring buffer? Seems to work ok tho
-        if busy.is_high() {
-            led.set_high()
-        } else {
-            led.set_low()
-        }
-
-        player_state = match player_state {
-            // When the voice stops
-            PlayerState::Playing if busy.is_high() => PlayerState::Stopped,
-            // Never happens, but if in some bizzare case the arduino is
-            // rebootet during the playback this should kill the audio
-            PlayerState::Stopped if busy.is_low() => {
-                dfplayer_command(&mut serial, CMD_STOP, 0, 0);
-                PlayerState::Stopped
-            }
-            state => state,
+        match state.next(Some(Input::Hook(HookInput::Off))) {
+            None => {    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(1))},
+            Some(_) => {},
         };
-
-        if let Some(_) = debounced_button.update(button.is_high()) {
-            player_state = match player_state {
-                PlayerState::Stopped => {
-                    dfplayer_command(&mut serial, CMD_SET_VOLUME, 0, VOLUME_MAX);
-                    dfplayer_command(&mut serial, CMD_PLAY_TRACK, 0, 1);
-                    while busy.is_high() {
-                        arduino_hal::delay_ms(TIME_DELTA_MS);
-                    }
-                    PlayerState::Playing
-                }
-                PlayerState::Playing => {
-                    for volume in (0..VOLUME_MAX).rev() {
-                        dfplayer_command(&mut serial, CMD_SET_VOLUME, 0x00, volume);
-                    }
-                    dfplayer_command(&mut serial, CMD_STOP, 0, 0);
-                    while busy.is_low() {
-                        arduino_hal::delay_ms(TIME_DELTA_MS);
-                    }
-                    PlayerState::Stopped
-                }
-            };
-
-            // Dropping previous button values to prevent weird things
-            // from happening if button was messed with during the
-            // fadeout grace period
-            debounced_button = debounce_stateful_16(button.is_high());
-        }
-
-        arduino_hal::delay_ms(TIME_DELTA_MS);
+        arduino_hal::delay_ms(TIME_STEP_MS);
     }
 }

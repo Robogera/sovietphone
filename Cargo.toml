@@ -1,12 +1,12 @@
 [package]
-name = "soviethome"
+name = "sovietphone"
 version = "0.1.0"
 authors = ["Gera Cherdakly <robogera@gmail.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "soviethome"
+name = "sovietphone"
 test = false
 bench = false
 
