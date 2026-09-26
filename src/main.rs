@@ -76,9 +76,20 @@ enum Track {
     ContinuousBeep = 4u16,
 }
 
+#[derive(Clone, Copy)]
 enum Coil {
     Left,
     Right,
+}
+
+impl Coil {
+    fn flip(&self) -> Coil {
+        use Coil::*;
+        match self {
+            Right => Left,
+            Left => Right,
+        }
+    }
 }
 
 enum Effect {
@@ -157,30 +168,16 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
         },
 
         // Count down time when ringing
-        // TODO: reduce verbosity
-        (Ringing { coil, wait_ms }, _) => match coil {
-            Some(Left) => (
+        (Ringing { coil, wait_ms }, _) => {
+            let next_coil = coil.as_ref().map(Coil::flip);
+            (
                 Ringing {
-                    coil: Some(Right),
+                    coil: next_coil.clone(),
                     wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
                 },
-                Some(PowerCoil(Some(Right))),
-            ),
-            Some(Right) => (
-                Ringing {
-                    coil: Some(Left),
-                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
-                },
-                Some(PowerCoil(Some(Left))),
-            ),
-            None => (
-                Ringing {
-                    coil: None,
-                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
-                },
-                Some(PowerCoil(None)),
-            ),
-        },
+                Some(PowerCoil(next_coil)),
+            )
+        }
 
         // Shut the continuous beep when the dial starts moving
         (WaitingForDial, Some(Dial(Moving))) => (
@@ -324,8 +321,8 @@ fn main() -> ! {
 
     loop {
         match state.next(Some(Input::Hook(HookInput::Off))) {
-            None => {    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(1))},
-            Some(_) => {},
+            None => dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(1)),
+            Some(_) => {}
         };
         arduino_hal::delay_ms(TIME_STEP_MS);
     }
