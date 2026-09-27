@@ -107,7 +107,6 @@ enum Effect {
 
 use Coil::*;
 use DialState::*;
-use Edge::{Falling, Rising};
 use Effect::*;
 use HookInput::*;
 use Input::*;
@@ -334,7 +333,10 @@ fn main() -> ! {
                 _ => None,
             })
             .or_else(|| match dial_pulse_edge {
-                Some(Edge::Rising) => Some(Pulse),
+                Some(Edge::Rising) => {
+                    led.toggle();
+                    Some(Pulse)
+                },
                 _ => None,
             });
 
