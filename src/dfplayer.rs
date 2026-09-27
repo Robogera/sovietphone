@@ -71,5 +71,5 @@ pub fn send<W: WriteFrame>(serial: &mut W, command: DFPlayerCommand) {
     ];
 
     serial.write_frame(frame);
-    arduino_hal::delay_ms(10);
+    // arduino_hal::delay_ms(10);
 }
