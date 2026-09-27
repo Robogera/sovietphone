@@ -106,6 +106,7 @@ enum Effect {
     LoopTrack(Track),
     StopPlayback,
     PowerCoil(Option<Coil>),
+    Debug(u32),
 }
 
 use Coil::*;
@@ -115,6 +116,7 @@ use HookInput::*;
 use Input::*;
 use State::*;
 use Track::*;
+use ufmt::uWrite;
 
 impl State {
     fn next(&mut self, input: Option<Input>) -> Option<Effect> {
@@ -205,14 +207,21 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
                 wait_ms: _,
             },
             Some(Dial(Stopped)),
-        ) => (
-            Some(Dialing {
-                number: number.saturating_mul(10).saturating_add(*pulses),
-                pulses: 0,
-                wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
-            }),
-            None,
-        ),
+        ) => {
+            let new_number = if *pulses > 0 {
+                number.saturating_mul(10).saturating_add(*pulses)
+            } else {
+                *number
+            };
+            (
+                Some(Dialing {
+                    number: new_number,
+                    pulses: 0,
+                    wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
+                }),
+                Some(Debug(new_number as u32)),
+            )
+        }
 
         // Increment the pulse counter
         (
@@ -357,15 +366,22 @@ fn main() -> ! {
                 _ => None,
             })
             .or_else(|| match dial_pulse_edge {
-                Some(Edge::Rising) => {
-                    led.toggle();
-                    Some(Pulse)
-                }
+                Some(Edge::Rising) => Some(Pulse),
                 _ => None,
             });
 
         if let Some(effect) = state.next(input) {
             match effect {
+                Debug(number) => {
+                    if number == CORRECT_NUMBER as u32 {
+                          led.toggle();
+                          arduino_hal::delay_ms(400);
+                          led.toggle();
+                    }
+                    // for byte in number.to_be_bytes() {
+                    //     serial.write_byte(byte);
+                    // }
+                }
                 PlayTrack(track) => {
                     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
                     arduino_hal::delay_ms(50);
