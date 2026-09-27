@@ -1,9 +1,12 @@
 #![no_std]
 #![no_main]
 
+mod debounce;
 mod dfplayer;
 
 use dfplayer::DFPlayerCommand;
+
+use debounce::{Debounced, Edge, Measurable};
 
 use panic_halt as _;
 
@@ -13,6 +16,18 @@ const RETURN_CALL_DELAY_MS: u32 = 8500;
 const CORRECT_NUMBER: u8 = 16;
 const COIL_ON_MS: u32 = 1000;
 const COIL_OFF_MS: u32 = 4000;
+
+use arduino_hal::port::{mode, Pin};
+
+impl<PIN> Measurable for Pin<mode::Input<mode::PullUp>, PIN>
+where
+    PIN: arduino_hal::port::PinOps,
+{
+    fn is_up(&self) -> bool {
+        // <Self>::is_high(self)
+        self.is_high()
+    }
+}
 
 impl<USART, RX, TX> dfplayer::WriteFrame for arduino_hal::Usart<USART, RX, TX>
 where
@@ -25,24 +40,15 @@ where
     }
 }
 
-enum CallType {
-    Outgoing,
-    Incoming,
-}
-
-type UntilReturnCallMs = u32;
-
 enum State {
-    Idle {
-        until_return_call_ms: Option<u32>,
-    },
+    IdleWaitingForCallMs(Option<u32>),
     WaitingForDial,
     Dialing {
         number: u8,
         pulses: u8,
         wait_ms: u32,
     },
-    Call(CallType),
+    Call,
     WrongNumber,
     AudioEnded,
     Ringing {
@@ -53,14 +59,14 @@ enum State {
 
 enum Input {
     Hook(HookInput),
-    Dial(DialInput),
+    Dial(DialState),
     PlaybackOver,
+    Pulse,
 }
 
-enum DialInput {
+enum DialState {
     Moving,
     Stopped,
-    Pulse,
 }
 
 enum HookInput {
@@ -99,93 +105,93 @@ enum Effect {
     PowerCoil(Option<Coil>),
 }
 
+use Coil::*;
+use DialState::*;
+use Edge::{Falling, Rising};
+use Effect::*;
+use HookInput::*;
+use Input::*;
+use State::*;
+use Track::*;
+
 impl State {
     fn next(&mut self, input: Option<Input>) -> Option<Effect> {
-        let (new_state, effect) = apply_next_state(self, input);
-        *self = new_state;
+        let (maybe_new_state, effect) = apply_next_state(self, input);
+        if let Some(new_state) = maybe_new_state {
+            *self = new_state;
+        }
         effect
     }
 }
 
-fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effect>) {
-    use CallType::*;
-    use Coil::*;
-    use DialInput::*;
-    use Effect::*;
-    use HookInput::*;
-    use Input::*;
-    use State::*;
-    use Track::*;
-
+fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Option<Effect>) {
     match (state, input) {
         // Play a continuous beep when the phone is off the hook
-        (
-            Idle {
-                until_return_call_ms: _,
-            },
-            Some(Hook(Off)),
-        ) => (WaitingForDial, Some(LoopTrack(ContinuousBeep))),
+        (IdleWaitingForCallMs(_), Some(Hook(Off))) => {
+            (Some(WaitingForDial), Some(LoopTrack(ContinuousBeep)))
+        }
 
         // Start ringing when the time comes for scheduled incoming call
-        (
-            Idle {
-                until_return_call_ms: Some(0),
-            },
-            None,
-        ) => (
-            Ringing {
+        (IdleWaitingForCallMs(Some(0)), None) => (
+            Some(Ringing {
                 coil: Some(Left),
                 wait_ms: COIL_ON_MS,
-            },
+            }),
             Some(PowerCoil(Some(Left))),
         ),
 
-        // Stop the ringing when the phone is off the hook
+        // Decrement time counter
+        (IdleWaitingForCallMs(Some(time_ms)), None) => (
+            Some(IdleWaitingForCallMs(Some(
+                time_ms.saturating_sub(TIME_STEP_MS),
+            ))),
+            None,
+        ),
+
+        // Stop the ringing and play incoming call track
+        // when the phone is off the hook
         (
             Ringing {
                 coil: _,
                 wait_ms: _,
             },
             Some(Hook(Off)),
-        ) => (Call(Incoming), Some(PlayTrack(VoiceIncoming))),
+        ) => (Some(Call), Some(PlayTrack(VoiceIncoming))),
 
-        // Switch the ring bell on/off
-        (Ringing { coil, wait_ms: 0 }, _) => match coil {
-            None => (
-                Ringing {
-                    coil: Some(Left),
-                    wait_ms: COIL_ON_MS,
-                },
-                Some(PowerCoil(Some(Left))),
-            ),
-            Some(_) => (
-                Ringing {
-                    coil: None,
-                    wait_ms: COIL_OFF_MS,
-                },
-                Some(PowerCoil(None)),
-            ),
-        },
+        // Switch the ring bell on/off in a realistic manner
+        (Ringing { coil, wait_ms: 0 }, _) => {
+            let next_coil = coil.xor(Some(Left));
+            (
+                Some(Ringing {
+                    coil: next_coil.clone(),
+                    wait_ms: match next_coil {
+                        None => COIL_OFF_MS,
+                        Some(_) => COIL_ON_MS,
+                    },
+                }),
+                Some(PowerCoil(next_coil)),
+            )
+        }
 
-        // Count down time when ringing
+        // Count down time when ringing, alternate coils
         (Ringing { coil, wait_ms }, _) => {
             let next_coil = coil.as_ref().map(Coil::flip);
             (
-                Ringing {
+                Some(Ringing {
                     coil: next_coil.clone(),
                     wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
-                },
+                }),
                 Some(PowerCoil(next_coil)),
             )
         }
 
         // Shut the continuous beep when the dial starts moving
         (WaitingForDial, Some(Dial(Moving))) => (
-            Dialing {
+            Some(Dialing {
                 number: 0,
                 pulses: 0,
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
-            },
+            }),
             Some(StopPlayback),
         ),
 
@@ -198,11 +204,11 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
             },
             Some(Dial(Stopped)),
         ) => (
-            Dialing {
+            Some(Dialing {
                 number: number.saturating_mul(10).saturating_add(*pulses),
                 pulses: 0,
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
-            },
+            }),
             None,
         ),
 
@@ -213,13 +219,13 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
                 pulses,
                 wait_ms: _,
             },
-            Some(Dial(Pulse)),
+            Some(Pulse),
         ) => (
-            Dialing {
+            Some(Dialing {
                 number: *number,
                 pulses: pulses.wrapping_add(1),
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
-            },
+            }),
             None,
         ),
 
@@ -231,18 +237,15 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
                 wait_ms: 0,
             },
             None,
-        ) => (Call(Outgoing), Some(PlayTrack(VoiceOutgoing))),
+        ) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
 
         // User waited until the voice clip ended. Play line busy signal
-        (Call(Outgoing), Some(PlaybackOver)) => (AudioEnded, Some(LoopTrack(ShortBeep))),
+        (Call, Some(PlaybackOver)) => (Some(AudioEnded), Some(LoopTrack(ShortBeep))),
 
-        // User hanged the phone during audio playback (rude) or after the audio has ended
-        (Call(Outgoing) | AudioEnded, Some(Hook(On))) => (
-            Idle {
-                until_return_call_ms: None,
-            },
-            Some(StopPlayback),
-        ),
+        // User hanged the phone during audio playback (rude) or after the audio has ended, back to idle
+        (Call | AudioEnded, Some(Hook(On))) => {
+            (Some(IdleWaitingForCallMs(None)), Some(StopPlayback))
+        }
 
         // Play the busy signal if the user didn't guess the number.
         (
@@ -252,7 +255,7 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
                 wait_ms: 0,
             },
             None,
-        ) => (WrongNumber, Some(LoopTrack(ShortBeep))),
+        ) => (Some(WrongNumber), Some(LoopTrack(ShortBeep))),
 
         // Schedule the return call if the phone was put down
         // after any incorrect interaction
@@ -266,19 +269,12 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (State, Option<Effec
             | WrongNumber,
             Some(Hook(On)),
         ) => (
-            Idle {
-                until_return_call_ms: Some(RETURN_CALL_DELAY_MS),
-            },
+            Some(IdleWaitingForCallMs(Some(RETURN_CALL_DELAY_MS))),
             Some(StopPlayback),
         ),
 
-        // Catchall
-        (_, _) => (
-            Idle {
-                until_return_call_ms: None,
-            },
-            None,
-        ),
+        // Catchall. Ignoring all other inputs
+        (_, _) => (None, None),
     }
 }
 
@@ -298,11 +294,6 @@ fn main() -> ! {
         arduino_hal::hal::usart::BaudrateArduinoExt::into_baudrate(9600),
     );
 
-    let dfplayer_busy = pins.d4.into_pull_up_input();
-    let handset = pins.d5.into_pull_up_input();
-    let dial_moved = pins.d6.into_pull_up_input();
-    let dial_pulse = pins.d7.into_pull_up_input();
-
     let mut led = pins.d13.into_output();
     led.set_low();
 
@@ -311,19 +302,71 @@ fn main() -> ! {
     coil1.set_low();
     coil2.set_low();
 
-    let mut state = State::Idle {
-        until_return_call_ms: None,
-    };
+    let mut dfplayer_busy = Debounced::new(pins.d4.into_pull_up_input());
+    let mut phone_hook = Debounced::new(pins.d5.into_pull_up_input());
+    let mut dial_moving = Debounced::new(pins.d6.into_pull_up_input());
+    let mut dial_pulse = Debounced::new(pins.d7.into_pull_up_input());
+
+    let mut state = State::IdleWaitingForCallMs(None);
 
     arduino_hal::delay_ms(1000);
 
     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
 
     loop {
-        match state.next(Some(Input::Hook(HookInput::Off))) {
-            None => dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(1)),
-            Some(_) => {}
-        };
+        let dfplayer_busy_edge = dfplayer_busy.poll();
+        let phone_hook_edge = phone_hook.poll();
+        let dial_moving_edge = dial_moving.poll();
+        let dial_pulse_edge = dial_pulse.poll();
+
+        let input = phone_hook_edge
+            .map(|edge| match edge {
+                Edge::Falling => Hook(Off),
+                Edge::Rising => Hook(On),
+            })
+            .or_else(|| match dfplayer_busy_edge {
+                Some(Edge::Rising) => Some(PlaybackOver),
+                _ => None,
+            })
+            .or_else(|| match dial_moving_edge {
+                Some(Edge::Rising) => Some(Dial(Stopped)),
+                Some(Edge::Falling) => Some(Dial(Moving)),
+                _ => None,
+            })
+            .or_else(|| match dial_pulse_edge {
+                Some(Edge::Rising) => Some(Pulse),
+                _ => None,
+            });
+
+        if let Some(effect) = state.next(input) {
+            match effect {
+                PlayTrack(track) => {
+                    // dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+                    // arduino_hal::delay_ms(50);
+                    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16))
+                }
+                LoopTrack(track) => {
+                    // dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+                    // arduino_hal::delay_ms(50);
+                    dfplayer::send(&mut serial, DFPlayerCommand::LoopTrack(track as u16))
+                }
+                StopPlayback => dfplayer::send(&mut serial, DFPlayerCommand::Stop),
+                PowerCoil(coil) => match coil {
+                    Some(Left) => {
+                        coil1.set_low();
+                        coil2.set_high();
+                    }
+                    Some(Right) => {
+                        coil2.set_low();
+                        coil1.set_high();
+                    }
+                    None => {
+                        coil2.set_low();
+                        coil1.set_low();
+                    }
+                },
+            };
+        }
         arduino_hal::delay_ms(TIME_STEP_MS);
     }
 }
