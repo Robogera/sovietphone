@@ -1,4 +1,4 @@
-use debouncr::{debounce_stateful_2, DebouncerStateful, Repeat2};
+use debouncr::{debounce_stateful_3, DebouncerStateful, Repeat3};
 
 pub use debouncr::Edge;
 
@@ -8,12 +8,12 @@ pub trait Measurable {
 
 pub struct Debounced<P: Measurable> {
     pin: P,
-    debouncer: DebouncerStateful<u8, Repeat2>,
+    debouncer: DebouncerStateful<u8, Repeat3>,
 }
 
 impl<P: Measurable> Debounced<P> {
     pub fn new(pin: P) -> Self {
-        let debouncer = debounce_stateful_2(pin.is_up());
+        let debouncer = debounce_stateful_3(pin.is_up());
         Self { pin, debouncer }
     }
 
@@ -21,8 +21,8 @@ impl<P: Measurable> Debounced<P> {
         self.debouncer.update(self.pin.is_up())
     }
 
-    pub fn raw(&self) -> bool {
-        self.pin.is_up()
-    }
+    // pub fn raw(&self) -> bool {
+    //     self.pin.is_up()
+    // }
 }
 

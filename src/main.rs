@@ -11,11 +11,14 @@ use debounce::{Debounced, Edge, Measurable};
 use panic_halt as _;
 
 const TIME_STEP_MS: u32 = 5;
-const WAIT_AFTER_LAST_DIGIT_MS: u32 = 1250;
+const TIME_STEP_RING_BELL_MS: u32 = 30;
+const WAIT_AFTER_LAST_DIGIT_MS: u32 = 3000;
 const RETURN_CALL_DELAY_MS: u32 = 8500;
 const CORRECT_NUMBER: u8 = 16;
 const COIL_ON_MS: u32 = 1000;
 const COIL_OFF_MS: u32 = 4000;
+
+const VOLUME: u16 = 28;
 
 use arduino_hal::port::{mode, Pin};
 
@@ -178,7 +181,7 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
             (
                 Some(Ringing {
                     coil: next_coil.clone(),
-                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
+                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS + TIME_STEP_RING_BELL_MS),
                 }),
                 Some(PowerCoil(next_coil)),
             )
@@ -238,14 +241,6 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
             None,
         ) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
 
-        // User waited until the voice clip ended. Play line busy signal
-        (Call, Some(PlaybackOver)) => (Some(AudioEnded), Some(LoopTrack(ShortBeep))),
-
-        // User hanged the phone during audio playback (rude) or after the audio has ended, back to idle
-        (Call | AudioEnded, Some(Hook(On))) => {
-            (Some(IdleWaitingForCallMs(None)), Some(StopPlayback))
-        }
-
         // Play the busy signal if the user didn't guess the number.
         (
             Dialing {
@@ -255,6 +250,31 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
             },
             None,
         ) => (Some(WrongNumber), Some(LoopTrack(ShortBeep))),
+
+        // Keep the countdown going
+        (
+            Dialing {
+                number,
+                pulses,
+                wait_ms,
+            },
+            None,
+        ) => (
+            Some(Dialing {
+                number: *number,
+                pulses: *pulses,
+                wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
+            }),
+            None,
+        ),
+
+        // User waited until the voice clip ended. Play line busy signal
+        (Call, Some(PlaybackOver)) => (Some(AudioEnded), Some(LoopTrack(ShortBeep))),
+
+        // User hanged the phone during audio playback (rude) or after the audio has ended, back to idle
+        (Call | AudioEnded, Some(Hook(On))) => {
+            (Some(IdleWaitingForCallMs(None)), Some(StopPlayback))
+        }
 
         // Schedule the return call if the phone was put down
         // after any incorrect interaction
@@ -309,6 +329,10 @@ fn main() -> ! {
     let mut state = State::IdleWaitingForCallMs(None);
 
     arduino_hal::delay_ms(1000);
+    dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+    arduino_hal::delay_ms(150);
+    dfplayer::send(&mut serial, DFPlayerCommand::SetVolume(VOLUME));
+    arduino_hal::delay_ms(150);
 
     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
 
@@ -336,20 +360,20 @@ fn main() -> ! {
                 Some(Edge::Rising) => {
                     led.toggle();
                     Some(Pulse)
-                },
+                }
                 _ => None,
             });
 
         if let Some(effect) = state.next(input) {
             match effect {
                 PlayTrack(track) => {
-                    // dfplayer::send(&mut serial, DFPlayerCommand::Stop);
-                    // arduino_hal::delay_ms(50);
+                    dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+                    arduino_hal::delay_ms(50);
                     dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16))
                 }
                 LoopTrack(track) => {
-                    // dfplayer::send(&mut serial, DFPlayerCommand::Stop);
-                    // arduino_hal::delay_ms(50);
+                    dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+                    arduino_hal::delay_ms(50);
                     dfplayer::send(&mut serial, DFPlayerCommand::LoopTrack(track as u16))
                 }
                 StopPlayback => dfplayer::send(&mut serial, DFPlayerCommand::Stop),
@@ -357,10 +381,12 @@ fn main() -> ! {
                     Some(Left) => {
                         coil1.set_low();
                         coil2.set_high();
+                        arduino_hal::delay_ms(TIME_STEP_RING_BELL_MS);
                     }
                     Some(Right) => {
                         coil2.set_low();
                         coil1.set_high();
+                        arduino_hal::delay_ms(TIME_STEP_RING_BELL_MS);
                     }
                     None => {
                         coil2.set_low();
