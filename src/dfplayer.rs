@@ -9,6 +9,7 @@ const FEEDBACK: u8 = 0x00;
 const CMD_PLAY_TRACK: u8 = 0x03;
 const CMD_SET_VOLUME: u8 = 0x06;
 const CMD_LOOP_TRACK: u8 = 0x08;
+const CMD_DISABLE_LOOP: u8 = 0x11;
 const CMD_STOP: u8 = 0x16;
 
 const MAX_VOLUME: u16 = 29;
@@ -18,6 +19,7 @@ pub enum DFPlayerCommand {
     PlayTrack(u16),
     LoopTrack(u16),
     SetVolume(u16),
+    DisableLoop,
 }
 
 fn get_checksum(
@@ -48,6 +50,7 @@ pub fn send<W: WriteFrame>(serial: &mut W, command: DFPlayerCommand) {
         DFPlayerCommand::PlayTrack(track) => (CMD_PLAY_TRACK, track.to_be_bytes()),
         DFPlayerCommand::LoopTrack(track) => (CMD_LOOP_TRACK, track.to_be_bytes()),
         DFPlayerCommand::SetVolume(volume) => (CMD_SET_VOLUME, volume.min(MAX_VOLUME).to_be_bytes()),
+        DFPlayerCommand::DisableLoop => (CMD_DISABLE_LOOP, 0u16.to_be_bytes()),
     };
 
     let (checksum_high, checksum_low) = get_checksum(

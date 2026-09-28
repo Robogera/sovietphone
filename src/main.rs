@@ -359,25 +359,25 @@ fn main() -> ! {
     let mut led = pins.d13.into_output();
     led.set_low();
 
-    let mut coil1 = pins.d8.into_output();
-    let mut coil2 = pins.d9.into_output();
+    let mut coil1_gnd = pins.d2.into_output();
+    let mut coil1 = pins.d3.into_output();
+    let mut coil2_gnd = pins.d4.into_output();
+    let mut coil2 = pins.d5.into_output();
     coil1.set_low();
     coil2.set_low();
 
-    let mut dfplayer_busy = Debounced::new(pins.d4.into_pull_up_input());
-    let mut phone_hook = Debounced::new(pins.d5.into_pull_up_input());
-    let mut dial_moving = Debounced::new(pins.d6.into_pull_up_input());
-    let mut dial_pulse = Debounced::new(pins.d7.into_pull_up_input());
+    let mut phone_hook = Debounced::new(pins.d6.into_pull_up_input());
+    let mut dial_moving = Debounced::new(pins.d7.into_pull_up_input());
+    let mut dial_pulse = Debounced::new(pins.d8.into_pull_up_input());
+    let mut dfplayer_busy = Debounced::new(pins.d9.into_pull_up_input());
 
     let mut state = State::IdleWaitingForCallMs(None);
 
     arduino_hal::delay_ms(1000);
     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
-    arduino_hal::delay_ms(150);
+    arduino_hal::delay_ms(50);
     dfplayer::send(&mut serial, DFPlayerCommand::SetVolume(VOLUME));
-    arduino_hal::delay_ms(150);
-
-    dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+    arduino_hal::delay_ms(50);
 
     loop {
         let dfplayer_busy_edge = dfplayer_busy.poll();
@@ -387,8 +387,8 @@ fn main() -> ! {
 
         let input = phone_hook_edge
             .map(|edge| match edge {
-                Edge::Falling => Hook(Off),
-                Edge::Rising => Hook(On),
+                Edge::Falling => Hook(On),
+                Edge::Rising => Hook(Off),
             })
             .or_else(|| match dfplayer_busy_edge {
                 Some(Edge::Rising) => Some(PlaybackOver),
@@ -409,8 +409,8 @@ fn main() -> ! {
                 Debug(number) => {
                     if number == CORRECT_NUMBER as u32 {
                         led.toggle();
-                        arduino_hal::delay_ms(400);
-                        led.toggle();
+                        // arduino_hal::delay_ms(200);
+                        // led.toggle();
                     }
                     // for byte in number.to_be_bytes() {
                     //     serial.write_byte(byte);
@@ -418,6 +418,8 @@ fn main() -> ! {
                 }
                 PlayTrack(track) => {
                     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
+                    arduino_hal::delay_ms(50);
+                    dfplayer::send(&mut serial, DFPlayerCommand::DisableLoop);
                     arduino_hal::delay_ms(50);
                     dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16))
                 }
