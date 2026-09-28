@@ -17,6 +17,7 @@ const RETURN_CALL_DELAY_MS: u32 = 8500;
 const CORRECT_NUMBER: u8 = 16;
 const COIL_ON_MS: u32 = 1000;
 const COIL_OFF_MS: u32 = 4000;
+const RING_TIMES: u8 = 5;
 
 const VOLUME: u16 = 28;
 
@@ -56,7 +57,8 @@ enum State {
     AudioEnded,
     Ringing {
         coil: Option<Coil>,
-        wait_ms: u32,
+        until_state_change_ms: u32,
+        rings_left: u8,
     },
 }
 
@@ -116,7 +118,6 @@ use HookInput::*;
 use Input::*;
 use State::*;
 use Track::*;
-use ufmt::uWrite;
 
 impl State {
     fn next(&mut self, input: Option<Input>) -> Option<Effect> {
@@ -139,7 +140,8 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         (IdleWaitingForCallMs(Some(0)), None) => (
             Some(Ringing {
                 coil: Some(Left),
-                wait_ms: COIL_ON_MS,
+                until_state_change_ms: COIL_ON_MS,
+                rings_left: RING_TIMES,
             }),
             Some(PowerCoil(Some(Left))),
         ),
@@ -157,20 +159,43 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         (
             Ringing {
                 coil: _,
-                wait_ms: _,
+                until_state_change_ms: _,
+                rings_left: _,
             },
             Some(Hook(Off)),
         ) => (Some(Call), Some(PlayTrack(VoiceIncoming))),
 
+        // Go back to idle if the phone wasn't picked up in time
+        (
+            Ringing {
+                coil: _,
+                until_state_change_ms: 0,
+                rings_left: 0,
+            },
+            _,
+        ) => (Some(IdleWaitingForCallMs(None)), Some(PowerCoil(None))),
+
         // Switch the ring bell on/off in a realistic manner
-        (Ringing { coil, wait_ms: 0 }, _) => {
+        (
+            Ringing {
+                coil,
+                until_state_change_ms: 0,
+                rings_left,
+            },
+            _,
+        ) => {
             let next_coil = coil.xor(Some(Left));
             (
                 Some(Ringing {
                     coil: next_coil.clone(),
-                    wait_ms: match next_coil {
+                    until_state_change_ms: match next_coil {
                         None => COIL_OFF_MS,
                         Some(_) => COIL_ON_MS,
+                    },
+                    rings_left: if let None = next_coil {
+                        rings_left.saturating_sub(1)
+                    } else {
+                        *rings_left
                     },
                 }),
                 Some(PowerCoil(next_coil)),
@@ -178,12 +203,21 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         }
 
         // Count down time when ringing, alternate coils
-        (Ringing { coil, wait_ms }, _) => {
+        (
+            Ringing {
+                coil,
+                until_state_change_ms: wait_ms,
+                rings_left,
+            },
+            _,
+        ) => {
             let next_coil = coil.as_ref().map(Coil::flip);
             (
                 Some(Ringing {
                     coil: next_coil.clone(),
-                    wait_ms: wait_ms.saturating_sub(TIME_STEP_MS + TIME_STEP_RING_BELL_MS),
+                    until_state_change_ms: wait_ms
+                        .saturating_sub(TIME_STEP_MS + TIME_STEP_RING_BELL_MS),
+                    rings_left: *rings_left,
                 }),
                 Some(PowerCoil(next_coil)),
             )
@@ -374,9 +408,9 @@ fn main() -> ! {
             match effect {
                 Debug(number) => {
                     if number == CORRECT_NUMBER as u32 {
-                          led.toggle();
-                          arduino_hal::delay_ms(400);
-                          led.toggle();
+                        led.toggle();
+                        arduino_hal::delay_ms(400);
+                        led.toggle();
                     }
                     // for byte in number.to_be_bytes() {
                     //     serial.write_byte(byte);
