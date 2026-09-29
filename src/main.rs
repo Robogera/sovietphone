@@ -14,7 +14,7 @@ const TIME_STEP_MS: u32 = 5;
 const TIME_STEP_RING_BELL_MS: u32 = 30;
 const WAIT_AFTER_LAST_DIGIT_MS: u32 = 3000;
 const RETURN_CALL_DELAY_MS: u32 = 8500;
-const CORRECT_NUMBER: u8 = 16;
+const CORRECT_DIGITS: [u8; 2] = [1, 6];
 const COIL_ON_MS: u32 = 1000;
 const COIL_OFF_MS: u32 = 4000;
 const RING_TIMES: u8 = 5;
@@ -44,11 +44,35 @@ where
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct LastTwoDigits {
+    buf: [u8; 2],
+    idx: u8,
+}
+
+impl LastTwoDigits {
+    const fn new() -> Self {
+        Self {
+            buf: [0, 0],
+            idx: 0,
+        }
+    }
+
+    fn push(&mut self, digit: u8) {
+        self.buf[self.idx as usize] = digit;
+        self.idx ^= 1; // 0 -> 1 -> 0
+    }
+
+    fn is_close_enough(&self, other: [u8; 2]) -> bool {
+        self.buf.iter().zip(other).all(|(x, y)| x.abs_diff(y) <= 1)
+    }
+}
+
 enum State {
     IdleWaitingForCallMs(Option<u32>),
     WaitingForDial,
     Dialing {
-        number: u8,
+        number: LastTwoDigits,
         pulses: u8,
         wait_ms: u32,
     },
@@ -137,7 +161,9 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         }
 
         // Loop comtinuous beeps manually because fuck dfplayer clones
-        (WaitingForDial, Some(PlaybackOver)) => (Some(WaitingForDial), Some(PlayTrack(ContinuousBeep))),
+        (WaitingForDial, Some(PlaybackOver)) => {
+            (Some(WaitingForDial), Some(PlayTrack(ContinuousBeep)))
+        }
 
         // Start ringing when the time comes for scheduled incoming call
         (IdleWaitingForCallMs(Some(0)), None) => (
@@ -229,7 +255,7 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         // Shut the continuous beep when the dial starts moving
         (WaitingForDial, Some(Dial(Moving))) => (
             Some(Dialing {
-                number: 0,
+                number: LastTwoDigits::new(),
                 pulses: 0,
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
             }),
@@ -245,18 +271,15 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
             },
             Some(Dial(Stopped)),
         ) => {
-            let new_number = if *pulses > 0 {
-                number.saturating_mul(10).saturating_add(*pulses)
-            } else {
-                *number
-            };
+            let mut new_number = *number;
+            new_number.push(*pulses);
             (
                 Some(Dialing {
                     number: new_number,
                     pulses: 0,
                     wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
                 }),
-                Some(Debug(new_number as u32)),
+                None,
             )
         }
 
@@ -280,12 +303,12 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         // Win! Play the outgoing call audio if user has guessed the secret number!!!
         (
             Dialing {
-                number: CORRECT_NUMBER,
+                number,
                 pulses: _,
                 wait_ms: 0,
             },
             None,
-        ) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
+        ) if number.is_close_enough(CORRECT_DIGITS) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
 
         // Play the busy signal if the user didn't guess the number.
         (
@@ -414,10 +437,8 @@ fn main() -> ! {
 
         if let Some(effect) = state.next(input) {
             match effect {
-                Debug(number) => {
-                    if number == CORRECT_NUMBER as u32 {
-                        led.toggle();
-                    }
+                Debug(_) => {
+                    led.toggle();
                 }
                 PlayTrack(track) => {
                     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
