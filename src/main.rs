@@ -363,7 +363,9 @@ fn main() -> ! {
     let mut coil1 = pins.d3.into_output();
     let mut coil2_gnd = pins.d4.into_output();
     let mut coil2 = pins.d5.into_output();
+    coil1_gnd.set_low();
     coil1.set_low();
+    coil2_gnd.set_low();
     coil2.set_low();
 
     let mut phone_hook = Debounced::new(pins.d6.into_pull_up_input());
@@ -419,14 +421,16 @@ fn main() -> ! {
                 PlayTrack(track) => {
                     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
                     arduino_hal::delay_ms(50);
-                    dfplayer::send(&mut serial, DFPlayerCommand::DisableLoop);
+                    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16));
                     arduino_hal::delay_ms(50);
-                    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16))
                 }
                 LoopTrack(track) => {
                     dfplayer::send(&mut serial, DFPlayerCommand::Stop);
                     arduino_hal::delay_ms(50);
-                    dfplayer::send(&mut serial, DFPlayerCommand::LoopTrack(track as u16))
+                    dfplayer::send(&mut serial, DFPlayerCommand::PlayTrack(track as u16));
+                    arduino_hal::delay_ms(250);
+                    // dfplayer::send(&mut serial, DFPlayerCommand::LoopCurrent);
+                    // arduino_hal::delay_ms(50);
                 }
                 StopPlayback => dfplayer::send(&mut serial, DFPlayerCommand::Stop),
                 PowerCoil(coil) => match coil {
