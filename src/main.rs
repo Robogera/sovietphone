@@ -50,29 +50,10 @@ struct LastTwoDigits {
     idx: u8,
 }
 
-impl LastTwoDigits {
-    const fn new() -> Self {
-        Self {
-            buf: [0, 0],
-            idx: 0,
-        }
-    }
-
-    fn push(&mut self, digit: u8) {
-        self.buf[self.idx as usize] = digit;
-        self.idx ^= 1; // 0 -> 1 -> 0
-    }
-
-    fn is_close_enough(&self, other: [u8; 2]) -> bool {
-        self.buf.iter().zip(other).all(|(x, y)| x.abs_diff(y) <= 1)
-    }
-}
-
 enum State {
     IdleWaitingForCallMs(Option<u32>),
     WaitingForDial,
     Dialing {
-        number: LastTwoDigits,
         pulses: u8,
         wait_ms: u32,
     },
@@ -255,82 +236,55 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         // Shut the continuous beep when the dial starts moving
         (WaitingForDial, Some(Dial(Moving))) => (
             Some(Dialing {
-                number: LastTwoDigits::new(),
                 pulses: 0,
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
             }),
             Some(StopPlayback),
         ),
 
-        // Count the pulses when the rotary dial comes to rest
-        (
-            Dialing {
-                number,
-                pulses,
-                wait_ms: _,
-            },
-            Some(Dial(Stopped)),
-        ) => {
-            let mut new_number = *number;
-            new_number.push(*pulses);
-            (
-                Some(Dialing {
-                    number: new_number,
-                    pulses: 0,
-                    wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
-                }),
-                None,
-            )
-        }
-
         // Increment the pulse counter
         (
             Dialing {
-                number,
                 pulses,
                 wait_ms: _,
             },
             Some(Pulse),
         ) => (
             Some(Dialing {
-                number: *number,
                 pulses: pulses.wrapping_add(1),
                 wait_ms: WAIT_AFTER_LAST_DIGIT_MS,
             }),
             None,
         ),
 
-        // Win! Play the outgoing call audio if user has guessed the secret number!!!
+        // Play the busy signal if the user didn't interact with the dial
         (
             Dialing {
-                number,
-                pulses: _,
-                wait_ms: 0,
-            },
-            None,
-        ) if number.is_close_enough(CORRECT_DIGITS) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
-
-        // Play the busy signal if the user didn't guess the number.
-        (
-            Dialing {
-                number: _,
-                pulses: _,
+                pulses: 0,
                 wait_ms: 0,
             },
             None,
         ) => (Some(WrongNumber), Some(PlayTrack(ShortBeep))),
 
+
+        // Win! Play the outgoing call audio if user has inputted at least a single number
+        (
+            Dialing {
+                pulses: _,
+                wait_ms: 0,
+            },
+            None,
+        ) => (Some(Call), Some(PlayTrack(VoiceOutgoing))),
+
         // Keep the countdown going
         (
             Dialing {
-                number,
                 pulses,
                 wait_ms,
             },
             None,
         ) => (
             Some(Dialing {
-                number: *number,
                 pulses: *pulses,
                 wait_ms: wait_ms.saturating_sub(TIME_STEP_MS),
             }),
@@ -353,7 +307,6 @@ fn apply_next_state(state: &State, input: Option<Input>) -> (Option<State>, Opti
         (
             WaitingForDial
             | Dialing {
-                number: _,
                 pulses: _,
                 wait_ms: _,
             }
